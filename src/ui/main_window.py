@@ -1358,6 +1358,8 @@ class MainWindow(QMainWindow):
         table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.SelectedClicked)
         # 启用键盘选择
         table.setSelectionMode(QTableWidget.ExtendedSelection)
+        # 设置行高
+        table.verticalHeader().setDefaultSectionSize(45)
 
     def _format_account_status(self, status: str) -> tuple[str, str]:
         """格式化账号状态，返回(显示文本, 颜色)"""
@@ -1366,6 +1368,7 @@ class MainWindow(QMainWindow):
             "active": ("✅ 活跃", "#28a745"),
             "error": ("❌ 错误", "#dc3545"),
             "banned": ("🚫 已封禁", "#dc3545"),
+            "frozen": ("🧊 冻结", "#9b59b6"),  # Purple
             "unauthorized": ("⚠️ 未授权", "#ffc107"),
             "unknown": ("❓ 未检测", "#ff9800"),  # 橙色，表示需要检测
             "login_failed": ("⛔ 登录失败", "#dc3545"),

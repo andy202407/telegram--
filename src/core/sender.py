@@ -14,7 +14,7 @@ from telethon.tl.types import InputPhoneContact
 
 from ..db.repo import Repo
 from ..db.models import Account, Target, SendRun, SendLog
-from ..login import login_account_by_index
+from ..login import login_account_by_phone
 
 
 class SenderEngine:
@@ -49,16 +49,24 @@ class SenderEngine:
 
         try:
             print("DEBUG: 开始获取可用账号")
-            # 获取所有可用的账号（状态正常，不在限制期内）
+            # 获取所有可用的账号（排除frozen、banned等永久不可用状态）
             with self.repo.session() as s:
                 now = datetime.utcnow()
-                # 获取状态为ok的账号
-                ok_accounts = s.query(Account).filter(Account.status == "ok").all()
-                print(f"DEBUG: 找到 {len(ok_accounts)} 个状态为ok的账号")
+                # 获取状态为ok或limited的账号（limited可能恢复）
+                ok_accounts = s.query(Account).filter(
+                    Account.status.in_(["ok", "limited"])
+                ).all()
+                print(f"DEBUG: 找到 {len(ok_accounts)} 个可用状态的账号")
                 
-                # 过滤掉限制期内的账号
+                # 过滤掉限制期内的账号和永久不可用的账号
                 available_accounts = []
                 for acc in ok_accounts:
+                    # Skip permanently disabled accounts
+                    if acc.status in ["frozen", "banned", "revoked", "invalid"]:
+                        self.on_log(f"⏭️ 跳过账号 {acc.phone}: 状态={acc.status}")
+                        continue
+                    
+                    
                     if acc.is_limited and acc.limited_until:
                         # 检查是否超过12小时限制期
                         if now < acc.limited_until:
@@ -177,6 +185,36 @@ class SenderEngine:
                                 # 如果是账号限制，立即停止该账号
                                 if is_limited:
                                     self.on_log(f"⚠️ 账号 {phone} 被限制，立即停止该账号")
+                                    # Update account status immediately
+                                    try:
+                                        with self.repo.session() as s:
+                                            from ..db.models import Account
+                                            acc = s.get(Account, account_id)
+                                            if acc:
+                                                # Check error type to set appropriate status
+                                                if ("frozen" in (error or "").lower() or 
+                                                    "invalid" in (error or "").lower() or
+                                                    "An invalid Peer was used" in (error or "")):
+                                                    acc.status = "frozen"
+                                                    acc.is_limited = True
+                                                    acc.limited_until = None
+                                                    self.on_log(f"🧊 账号 {phone} 状态已更新为冻结")
+                                                elif "banned" in (error or "").lower() or "PHONE_NUMBER_BANNED" in (error or "") or "被封禁" in (error or ""):
+                                                    acc.status = "banned"
+                                                    acc.is_limited = True
+                                                    acc.limited_until = None
+                                                    self.on_log(f"🚫 账号 {phone} 状态已更新为封禁")
+                                                else:
+                                                    # Default to limited
+                                                    from datetime import timedelta
+                                                    acc.is_limited = True
+                                                    acc.limited_until = datetime.utcnow() + timedelta(hours=12)
+                                                    acc.status = "limited"
+                                                    self.on_log(f"⏰ 账号 {phone} 状态已更新为限制")
+                                                s.commit()
+                                    except Exception as db_e:
+                                        self.on_log(f"⚠️ 更新账号 {phone} 状态失败: {db_e}")
+                                    
                                     break
                                 
                         except Exception as e:
@@ -322,14 +360,18 @@ class SenderEngine:
         client = None
         
         try:
-            # 登录账号
+            # 登录账号 - 使用手机号而不是索引
             try:
+                # 添加调试信息
+                self.on_log(f"🔍 尝试登录账号 {phone} (ID: {account_id})")
                 client, _ = await asyncio.wait_for(
-                    login_account_by_index(account_id - 1), 
+                    login_account_by_phone(phone), 
                     timeout=30.0
                 )
             except Exception as e:
-                return (False, f"登录失败: {e}", False)
+                error_msg = f"登录失败: {e}"
+                self.on_log(f"❌ {error_msg}")
+                return (False, error_msg, False)
             
             if not client:
                 return (False, "登录失败: 无法获取客户端", False)
@@ -423,8 +465,10 @@ class SenderEngine:
         try:
             # 登录账号，添加超时保护（有锁保护，不需要重试）
             try:
+                # 添加调试信息
+                self.on_log(f"🔍 尝试登录账号 {phone} (ID: {account_id})")
                 client, _ = await asyncio.wait_for(
-                    login_account_by_index(account_id - 1), 
+                    login_account_by_phone(phone), 
                     timeout=30.0  # 30秒超时
                 )
             except asyncio.TimeoutError:
@@ -732,7 +776,28 @@ class SenderEngine:
                         # 即使添加失败，也尝试发送
                         
                 except Exception as add_e:
+                    error_str = str(add_e)
                     self.on_log(f"❌ 添加联系人异常: {clean_phone} - {add_e}")
+                    
+                    # Check if account is frozen
+                    if "frozen account" in error_str.lower():
+                        self.on_log(f"🧊 账号被冻结，立即停止")
+                        # Update account status immediately
+                        try:
+                            with self.repo.session() as s:
+                                from ..db.models import Account
+                                acc = s.get(Account, account_id)
+                                if acc:
+                                    acc.status = "frozen"
+                                    acc.is_limited = True
+                                    acc.limited_until = None
+                                    s.commit()
+                        except Exception as db_e:
+                            self.on_log(f"⚠️ 更新账号冻结状态失败: {db_e}")
+                        
+                        # Stop trying to send
+                        return (False, f"账号被冻结: {error_str}", True)
+                    
                     # 即使添加失败，也尝试发送
                 
                 identifier = clean_phone
@@ -815,6 +880,22 @@ class SenderEngine:
                     self.on_log(f"⚠️ 更新账号限制状态失败: {db_e}")
                 
                 return (False, error_str, True)  # 失败且需要限制账号
+            elif "frozen account" in error_str.lower() or "ACCOUNT_FROZEN" in error_str:
+                self.on_log(f"🧊 账号被冻结: {error_str}")
+                # Update status
+                try:
+                    with self.repo.session() as s:
+                        from ..db.models import Account
+                        acc = s.get(Account, account_id)
+                        if acc:
+                            acc.status = "frozen"
+                            acc.is_limited = True
+                            acc.limited_until = None
+                            s.commit()
+                except Exception as db_e:
+                    self.on_log(f"⚠️ 更新账号冻结状态失败: {db_e}")
+                
+                return (False, f"账号被冻结: {error_str}", True)
             elif "PHONE_NUMBER_BANNED" in error_str or "PHONE_BANNED" in error_str:
                 # 手机号被封禁
                 self.on_log(f"🚫 账号被封禁: {error_str}")
@@ -833,6 +914,23 @@ class SenderEngine:
                     return (False, f"联系人未找到: {identifier} (可能需要手动添加)", False)
                 else:
                     return (False, f"用户未找到: {identifier}", False)
+            elif "invalid" in error_str.lower():
+                # 包含 "invalid" 关键词的错误 - 通常是账号被封/冻结
+                # 更新账号状态为冻结
+                try:
+                    with self.repo.session() as s:
+                        from ..db.models import Account
+                        acc = s.get(Account, account_id)
+                        if acc:
+                            acc.status = "frozen"
+                            acc.is_limited = True
+                            acc.limited_until = None
+                            s.commit()
+                            self.on_log(f"🧊 账号状态已更新为冻结")
+                except Exception as db_e:
+                    self.on_log(f"⚠️ 更新账号冻结状态失败: {db_e}")
+                
+                return (False, error_str, True)  # 返回原始错误信息，停止该账号
             return (False, str(e), False)
 
     def stop(self):
