@@ -107,9 +107,9 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Telegram session files
-*.session
-*.json
+# Telegram session files (commented out to allow upload)
+# *.session
+# *.json
 
 # Database files
 *.db
